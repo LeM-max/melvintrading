@@ -1,0 +1,257 @@
+//@version=5
+indicator("LeM — Order Blocks V1", overlay=true, max_boxes_count=200)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var string G1 = "── Détection ──"
+i_conf_win  = input.int  (10,  "Fenêtre confirmation (M bougies)",    minval=3,  maxval=100, group=G1,
+             tooltip="Nombre max de bougies pour confirmer FVG + BOS après l'OB. Passé ce délai, le candidat est annulé.")
+i_fvg_win   = input.int  (5,   "Fenêtre FVG (K bougies)",             minval=1,  maxval=20,  group=G1,
+             tooltip="L'imbalance doit apparaître dans les K bougies qui suivent l'OB.")
+i_liq_win   = input.int  (10,  "Fenêtre sweep / pivot (L bougies)",   minval=3,  maxval=100, group=G1,
+             tooltip="Fenêtre lookback pour détecter le sweep de liquidité et le niveau de référence du BOS.")
+
+var string G2 = "── Filtres ──"
+i_ob_atr    = input.float(0.3, "Taille min bougie OB (× ATR)",        minval=0.0, step=0.1,  group=G2,
+             tooltip="Filtre les dojis et petites bougies sans conviction.")
+i_imp_atr   = input.float(1.5, "Taille min impulsion (× ATR)",        minval=0.0, step=0.1,  group=G2,
+             tooltip="La distance entre l'extrême de l'OB et le plus loin atteint par l'impulsion.")
+i_swp_min   = input.float(0.1, "Profondeur min sweep (× ATR)",        minval=0.0, step=0.05, group=G2,
+             tooltip="Amplitude minimale du sweep pour qu'il soit considéré significatif.")
+i_ov_pct    = input.float(50,  "Seuil chevauchement OB (%)",          minval=10,  step=5,    group=G2,
+             tooltip="Si un nouvel OB chevauche un OB existant à plus de ce seuil, l'ancien est supprimé.")
+i_max_obs   = input.int  (10,  "Nombre max OB actifs",                minval=1,  maxval=10,  group=G2)
+
+var string G3 = "── Affichage ──"
+i_col_bg    = input.color(color.new(color.gray, 75), "Fond de l'OB",    group=G3)
+i_col_bd    = input.color(color.new(color.gray, 20), "Bordure de l'OB", group=G3)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UDT — Order Block actif
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type OB
+    float top
+    float bot
+    bool  is_bull
+    int   bar_idx
+    box   bx
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ÉTAT GLOBAL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var OB[]    active = array.new<OB>()   // OBs émis et visibles sur le graphe
+
+// Candidats en attente de confirmation (FVG + BOS)
+// On n'ajoute un candidat que si le sweep est déjà validé à la création.
+var int[]   c_bar  = array.new<int>()
+var float[] c_top  = array.new<float>()
+var float[] c_bot  = array.new<float>()
+var bool[]  c_bull = array.new<bool>()
+var float[] c_ref  = array.new<float>() // résistance (bull) ou support (bear) à casser pour le BOS
+var float[] c_atr  = array.new<float>() // ATR au moment de la création (pour le filtre impulsion)
+var bool[]  c_fvg  = array.new<bool>()
+var bool[]  c_bos  = array.new<bool>()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITAIRES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atr14 = ta.atr(14)
+
+// Pourcentage de recouvrement entre deux zones [b1,t1] et [b2,t2]
+// Retourne 0 si pas de chevauchement, sinon le % sur la plus petite des deux zones.
+f_overlap(float t1, float b1, float t2, float b2) =>
+    ov = math.min(t1, t2) - math.max(b1, b2)
+    sz = math.min(t1 - b1, t2 - b2)
+    (ov <= 0 or sz <= 0) ? 0.0 : 100.0 * ov / sz
+
+// Émettre un OB confirmé : gère les conflits puis crée la box.
+f_emit(int ob_bar, float ob_top, float ob_bot, bool ob_bull) =>
+    // Supprimer tout OB existant qui chevauche trop (le nouvel OB, plus récent, prime)
+    to_del = array.new<int>()
+    for i = 0 to array.size(active) - 1
+        o = array.get(active, i)
+        if f_overlap(ob_top, ob_bot, o.top, o.bot) > i_ov_pct
+            array.push(to_del, i)
+    for k = array.size(to_del) - 1 to 0
+        idx = array.get(to_del, k)
+        box.delete(array.get(active, idx).bx)
+        array.remove(active, idx)
+    // Créer la box (extend.right : s'étend jusqu'à mitigation ou fin du graphe)
+    bx = box.new(ob_bar, ob_top, bar_index + 1, ob_bot,
+                 bgcolor=i_col_bg, border_color=i_col_bd,
+                 border_width=1, extend=extend.right)
+    array.push(active, OB.new(ob_top, ob_bot, ob_bull, ob_bar, bx))
+    // Cap : purger le plus ancien si on dépasse le max
+    while array.size(active) > i_max_obs
+        oldest = array.get(active, 0)
+        box.delete(oldest.bx)
+        array.remove(active, 0)
+
+// Supprimer des candidats par indices (triés en décroissant pour éviter les décalages)
+f_remove_cands(int[] indices) =>
+    n = array.size(indices)
+    if n > 0
+        // Tri à bulles décroissant
+        for a = 0 to n - 2
+            for b = 0 to n - 2 - a
+                if array.get(indices, b) < array.get(indices, b + 1)
+                    tmp = array.get(indices, b)
+                    array.set(indices, b, array.get(indices, b + 1))
+                    array.set(indices, b + 1, tmp)
+        for k = 0 to n - 1
+            idx = array.get(indices, k)
+            array.remove(c_bar,  idx)
+            array.remove(c_top,  idx)
+            array.remove(c_bot,  idx)
+            array.remove(c_bull, idx)
+            array.remove(c_ref,  idx)
+            array.remove(c_atr,  idx)
+            array.remove(c_fvg,  idx)
+            array.remove(c_bos,  idx)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOGIQUE PRINCIPALE — exécutée uniquement sur bougies fermées (non-repaint)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if barstate.isconfirmed
+
+    // ─── ÉTAPE 1 : MITIGATION ────────────────────────────────────────────────
+    // Dès qu'une bougie touche la zone d'un OB actif, l'OB est supprimé.
+    del_obs = array.new<int>()
+    for i = 0 to array.size(active) - 1
+        o = array.get(active, i)
+        if low <= o.top and high >= o.bot
+            array.push(del_obs, i)
+    for k = array.size(del_obs) - 1 to 0
+        idx = array.get(del_obs, k)
+        box.delete(array.get(active, idx).bx)
+        array.remove(active, idx)
+
+    // ─── ÉTAPE 2 : MISE À JOUR DES CANDIDATS ─────────────────────────────────
+    // Pour chaque candidat en attente, on tente de valider FVG + BOS.
+    // Si les deux sont confirmés ET l'impulsion est suffisante → émission.
+    // Si la fenêtre M est dépassée → purge.
+    to_emit  = array.new<int>()
+    to_purge = array.new<int>()
+
+    for i = 0 to array.size(c_bar) - 1
+        cb = array.get(c_bar, i)
+
+        // Expiration du candidat (fenêtre M dépassée)
+        if (bar_index - cb) > i_conf_win
+            array.push(to_purge, i)
+            continue
+
+        bull   = array.get(c_bull, i)
+        cref   = array.get(c_ref,  i)
+        catr   = array.get(c_atr,  i)
+        fvg_ok = array.get(c_fvg,  i)
+        bos_ok = array.get(c_bos,  i)
+
+        // Recherche d'une FVG dans la fenêtre [cb+1, cb+K]
+        // Pattern : low[C] > high[A] (bull) ou high[C] < low[A] (bear)
+        // où C = barre cible, A = 2 barres avant C (A, B, C consécutives)
+        if not fvg_ok
+            for kk = 1 to i_fvg_win
+                target = cb + kk
+                if target > bar_index - 1
+                    break
+                off = bar_index - target  // offset de "target" depuis la barre actuelle
+                if bull and low[off] > high[off + 2]
+                    fvg_ok := true
+                    break
+                if not bull and high[off] < low[off + 2]
+                    fvg_ok := true
+                    break
+
+        // BOS / CHoCH : clôture qui franchit le niveau de référence pré-calculé
+        if not bos_ok
+            if bull     and close > cref
+                bos_ok := true
+            if not bull and close < cref
+                bos_ok := true
+
+        array.set(c_fvg, i, fvg_ok)
+        array.set(c_bos, i, bos_ok)
+
+        // Quand FVG + BOS sont tous deux confirmés, on mesure l'impulsion totale
+        if fvg_ok and bos_ok
+            ob_off  = bar_index - cb
+            ct      = array.get(c_top, i)
+            cb_bot  = array.get(c_bot, i)
+
+            // Impulsion = distance entre l'extrême de l'OB et le plus loin atteint depuis
+            move_size = bull ? ta.highest(high, ob_off + 1) - cb_bot
+                             : ct - ta.lowest(low,  ob_off + 1)
+
+            if move_size >= i_imp_atr * catr
+                array.push(to_emit,  i)
+            else
+                array.push(to_purge, i) // impulsion confirmée mais trop courte → on rejette
+
+    // Émettre du plus ancien au plus récent : ainsi le plus récent écrase le plus ancien en cas de conflit
+    for k = 0 to array.size(to_emit) - 1
+        idx = array.get(to_emit, k)
+        f_emit(array.get(c_bar,  idx),
+               array.get(c_top,  idx),
+               array.get(c_bot,  idx),
+               array.get(c_bull, idx))
+
+    // Fusionner les indices à supprimer (émis + purgés) sans doublons
+    to_del_cands = array.copy(to_emit)
+    for k = 0 to array.size(to_purge) - 1
+        p = array.get(to_purge, k)
+        already = false
+        for m = 0 to array.size(to_del_cands) - 1
+            if array.get(to_del_cands, m) == p
+                already := true
+                break
+        if not already
+            array.push(to_del_cands, p)
+
+    f_remove_cands(to_del_cands)
+
+    // ─── ÉTAPE 3 : ENREGISTREMENT DES NOUVEAUX CANDIDATS ─────────────────────
+    // Un candidat est créé uniquement si le sweep est validé sur la barre actuelle.
+    // Toutes les autres conditions (FVG, BOS) sont vérifiées sur les barres suivantes.
+    ob_size = high - low
+    if ob_size >= i_ob_atr * atr14
+
+        // Bougie baissière → candidat bullish OB
+        // Sweep : le low brise le plus bas des L barres précédentes
+        if close < open
+            prev_low  = ta.lowest (low,  i_liq_win)[1]
+            swp_depth = prev_low - low
+            if low < prev_low and swp_depth >= i_swp_min * atr14
+                // Référence BOS = plus haut des L barres précédentes (résistance à franchir)
+                ref_h = ta.highest(high, i_liq_win)[1]
+                array.push(c_bar,  bar_index)
+                array.push(c_top,  high)
+                array.push(c_bot,  low)
+                array.push(c_bull, true)
+                array.push(c_ref,  ref_h)
+                array.push(c_atr,  atr14)
+                array.push(c_fvg,  false)
+                array.push(c_bos,  false)
+
+        // Bougie haussière → candidat bearish OB
+        // Sweep : le high brise le plus haut des L barres précédentes
+        if close > open
+            prev_high = ta.highest(high, i_liq_win)[1]
+            swp_depth = high - prev_high
+            if high > prev_high and swp_depth >= i_swp_min * atr14
+                // Référence BOS = plus bas des L barres précédentes (support à franchir)
+                ref_l = ta.lowest(low, i_liq_win)[1]
+                array.push(c_bar,  bar_index)
+                array.push(c_top,  high)
+                array.push(c_bot,  low)
+                array.push(c_bull, false)
+                array.push(c_ref,  ref_l)
+                array.push(c_atr,  atr14)
+                array.push(c_fvg,  false)
+                array.push(c_bos,  false)
