@@ -14,11 +14,11 @@ i_liq_win   = input.int  (10,  "Fenêtre sweep / pivot (L bougies)",   minval=3,
              tooltip="Fenêtre lookback pour détecter le sweep de liquidité et le niveau de référence du BOS.")
 
 var string G2 = "── Filtres ──"
-i_ob_atr    = input.float(0.3, "Taille min bougie OB (× ATR)",        minval=0.0, step=0.1,  group=G2,
+i_ob_atr    = input.float(0.0, "Taille min bougie OB (× ATR)",        minval=0.0, step=0.1,  group=G2,
              tooltip="Filtre les dojis et petites bougies sans conviction.")
-i_imp_atr   = input.float(1.5, "Taille min impulsion (× ATR)",        minval=0.0, step=0.1,  group=G2,
+i_imp_atr   = input.float(0.5, "Taille min impulsion (× ATR)",        minval=0.0, step=0.1,  group=G2,
              tooltip="La distance entre l'extrême de l'OB et le plus loin atteint par l'impulsion.")
-i_swp_min   = input.float(0.1, "Profondeur min sweep (× ATR)",        minval=0.0, step=0.05, group=G2,
+i_swp_min   = input.float(0.0, "Profondeur min sweep (× ATR)",        minval=0.0, step=0.05, group=G2,
              tooltip="Amplitude minimale du sweep pour qu'il soit considéré significatif.")
 i_ov_pct    = input.float(50,  "Seuil chevauchement OB (%)",          minval=10,  step=5,    group=G2,
              tooltip="Si un nouvel OB chevauche un OB existant à plus de ce seuil, l'ancien est supprimé.")
@@ -27,6 +27,10 @@ i_max_obs   = input.int  (10,  "Nombre max OB actifs",                minval=1, 
 var string G3 = "── Affichage ──"
 i_col_bg    = input.color(color.new(color.gray, 75), "Fond de l'OB",    group=G3)
 i_col_bd    = input.color(color.new(color.gray, 20), "Bordure de l'OB", group=G3)
+
+var string G4 = "── Debug ──"
+i_debug     = input.bool(true, "Afficher les marqueurs de debug", group=G4,
+             tooltip="Triangle vert/rouge = candidat créé (sweep OK). Losange jaune = FVG confirmée. Cercle bleu = BOS confirmé. Croix rouge = candidat rejeté (impulsion insuffisante ou expiration).")
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UDT — Order Block actif
@@ -55,6 +59,14 @@ var array<float> c_ref  = array.new<float>()  // résistance (bull) ou support (
 var array<float> c_atr  = array.new<float>()  // ATR au moment de la création (pour le filtre impulsion)
 var array<bool>  c_fvg  = array.new<bool>()
 var array<bool>  c_bos  = array.new<bool>()
+
+// Flags de debug — réinitialisés à chaque bougie
+bool dbg_cand_bull = false
+bool dbg_cand_bear = false
+bool dbg_fvg_new   = false
+bool dbg_bos_new   = false
+bool dbg_emit      = false
+bool dbg_reject    = false
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UTILITAIRES
@@ -159,6 +171,7 @@ if barstate.isconfirmed
 
             // Recherche d'une FVG dans la fenêtre [cb+1, cb+K]
             // Pattern : low[C] > high[A] (bull) ou high[C] < low[A] (bear)
+            was_fvg = fvg_ok
             if not fvg_ok
                 for kk = 1 to i_fvg_win
                     target = cb + kk
@@ -171,13 +184,18 @@ if barstate.isconfirmed
                     if not bull and high[off] < low[off + 2]
                         fvg_ok := true
                         break
+            if fvg_ok and not was_fvg
+                dbg_fvg_new := true
 
             // BOS / CHoCH : clôture qui franchit le niveau de référence pré-calculé
+            was_bos = bos_ok
             if not bos_ok
                 if bull     and close > cref
                     bos_ok := true
                 if not bull and close < cref
                     bos_ok := true
+            if bos_ok and not was_bos
+                dbg_bos_new := true
 
             array.set(c_fvg, i, fvg_ok)
             array.set(c_bos, i, bos_ok)
@@ -191,8 +209,10 @@ if barstate.isconfirmed
                                  : ct - ta.lowest(low,  ob_off + 1)
                 if move_size >= i_imp_atr * catr
                     array.push(to_emit,  i)
+                    dbg_emit := true
                 else
                     array.push(to_purge, i) // impulsion confirmée mais trop courte → on rejette
+                    dbg_reject := true
 
     // Émettre du plus ancien au plus récent : le plus récent écrase en cas de conflit
     if array.size(to_emit) > 0
@@ -238,6 +258,7 @@ if barstate.isconfirmed
                 array.push(c_atr,  atr14)
                 array.push(c_fvg,  false)
                 array.push(c_bos,  false)
+                dbg_cand_bull := true
 
         // Bougie haussière → candidat bearish OB
         if close > open
@@ -253,3 +274,21 @@ if barstate.isconfirmed
                 array.push(c_atr,  atr14)
                 array.push(c_fvg,  false)
                 array.push(c_bos,  false)
+                dbg_cand_bear := true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG — marqueurs visuels (top-level, désactivables via input)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+plotshape(i_debug and dbg_cand_bull, title="Candidat bullish (sweep)",
+          style=shape.triangleup,   location=location.belowbar, color=color.lime,   size=size.tiny)
+plotshape(i_debug and dbg_cand_bear, title="Candidat bearish (sweep)",
+          style=shape.triangledown, location=location.abovebar, color=color.red,    size=size.tiny)
+plotshape(i_debug and dbg_fvg_new,   title="FVG confirmée",
+          style=shape.diamond,      location=location.abovebar, color=color.yellow, size=size.tiny)
+plotshape(i_debug and dbg_bos_new,   title="BOS confirmé",
+          style=shape.circle,       location=location.belowbar, color=color.aqua,   size=size.tiny)
+plotshape(i_debug and dbg_emit,      title="OB émis",
+          style=shape.flag,         location=location.abovebar, color=color.white,  size=size.small)
+plotshape(i_debug and dbg_reject,    title="Candidat rejeté",
+          style=shape.xcross,       location=location.abovebar, color=color.fuchsia, size=size.tiny)
