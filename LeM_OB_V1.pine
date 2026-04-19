@@ -6,12 +6,14 @@ indicator("LeM — Order Blocks V1", overlay=true, max_boxes_count=200, max_bars
 // ═══════════════════════════════════════════════════════════════════════════════
 
 var string G1 = "── Détection ──"
-i_conf_win  = input.int  (10,  "Fenêtre confirmation (M bougies)",    minval=3,  maxval=100, group=G1,
+i_conf_win  = input.int  (20,  "Fenêtre confirmation (M bougies)",    minval=3,  maxval=100, group=G1,
              tooltip="Nombre max de bougies pour confirmer FVG + BOS après l'OB. Passé ce délai, le candidat est annulé.")
 i_fvg_win   = input.int  (5,   "Fenêtre FVG (K bougies)",             minval=1,  maxval=20,  group=G1,
              tooltip="L'imbalance doit apparaître dans les K bougies qui suivent l'OB.")
 i_liq_win   = input.int  (10,  "Fenêtre sweep / pivot (L bougies)",   minval=3,  maxval=100, group=G1,
-             tooltip="Fenêtre lookback pour détecter le sweep de liquidité et le niveau de référence du BOS.")
+             tooltip="Fenêtre lookback pour détecter le sweep de liquidité.")
+i_bos_win   = input.int  (3,   "Fenêtre BOS (bougies)",               minval=1,  maxval=20,  group=G1,
+             tooltip="Lookback pour le niveau de rupture (BOS). Plus court = BOS plus facile à déclencher.")
 
 var string G2 = "── Filtres ──"
 i_ob_atr    = input.float(0.0, "Taille min bougie OB (× ATR)",        minval=0.0, step=0.1,  group=G2,
@@ -249,7 +251,7 @@ if barstate.isconfirmed
             prev_low  = ta.lowest (low,  i_liq_win)[1]
             swp_depth = prev_low - low
             if low < prev_low and swp_depth >= i_swp_min * atr14
-                ref_h = ta.highest(high, i_liq_win)[1]
+                ref_h = ta.highest(high, i_bos_win)[1]
                 array.push(c_bar,  bar_index)
                 array.push(c_top,  high)
                 array.push(c_bot,  low)
@@ -265,7 +267,7 @@ if barstate.isconfirmed
             prev_high = ta.highest(high, i_liq_win)[1]
             swp_depth = high - prev_high
             if high > prev_high and swp_depth >= i_swp_min * atr14
-                ref_l = ta.lowest(low, i_liq_win)[1]
+                ref_l = ta.lowest(low, i_bos_win)[1]
                 array.push(c_bar,  bar_index)
                 array.push(c_top,  high)
                 array.push(c_bot,  low)
